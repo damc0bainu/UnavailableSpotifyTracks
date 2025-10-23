@@ -417,7 +417,7 @@ def start():
         sp,
         only_pl_id=only_pl_id,
         max_playlists=max_playlists,
-        include_liked=include_liked,
+        include_liked=True,
         dry_run=dry_run,
         batch_size=batch_size,
     )
