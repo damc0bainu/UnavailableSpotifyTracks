@@ -17,24 +17,16 @@ from flask import (
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 
-# Пытаемся импортировать тип исключения Spotipy (версионные различия учитываем)
 try:
     from spotipy.exceptions import SpotifyException
 except Exception:  # pragma: no cover
     class SpotifyException(Exception):
         pass
 
-###############################################################################
-# Конфиг
-###############################################################################
-
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "change-me-please")
 
-# Пауза между запросами (смягчает 429)
 SLEEP_BETWEEN = float(os.environ.get("RATE_LIMIT_SLEEP", "0.05"))
-
-# Базовая защита (опционально)
 BASIC_USER = os.environ.get("BASIC_AUTH_USER")
 BASIC_PASS = os.environ.get("BASIC_AUTH_PASS")
 
@@ -44,20 +36,14 @@ SCOPES = [
     "playlist-read-collaborative",
     "playlist-modify-private",
     "playlist-modify-public",
-    "user-library-read",  # обязательно
+    "user-library-read",
 ]
 
-# Хранилище задач (в памяти процесса)
 JOBS: Dict[str, Dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
 
-# Валидатор трек-URI
 URI_RE = re.compile(r"^spotify:track:[0-9A-Za-z]{22}$")
 
-
-###############################################################################
-# Утилиты
-###############################################################################
 
 def basic_auth():
     if not BASIC_USER or not BASIC_PASS:
@@ -105,35 +91,19 @@ def get_sp() -> Optional[spotipy.Spotify]:
 
 
 def normalize_playlist_id(value: str) -> str:
-    """
-    Принимает что угодно: ID, spotify:playlist:ID, https://open.spotify.com/playlist/ID
-    Возвращает чистый ID.
-    """
     if not value:
         return value
     value = value.strip()
-
-    # spotify:playlist:ID
     m = re.match(r"^spotify:playlist:([0-9A-Za-z]{22})$", value)
     if m:
         return m.group(1)
-
-    # https://open.spotify.com/playlist/ID (c ?si=…)
     m = re.search(r"/playlist/([0-9A-Za-z]{22})", value)
     if m:
         return m.group(1)
-
-    # уже ID?
     if re.match(r"^[0-9A-Za-z]{22}$", value):
         return value
-
-    # ничего не подошло — вернём исходное (чтобы сервер честно упал и показал проблему)
     return value
 
-
-###############################################################################
-# Доступ к API
-###############################################################################
 
 def iter_user_playlists(sp: spotipy.Spotify, max_playlists: Optional[int] = None) -> Iterable[dict]:
     limit, offset = 50, 0
@@ -158,7 +128,6 @@ def playlist_total_tracks(sp: spotipy.Spotify, playlist_id: str) -> int:
 
 def iter_playlist_items(sp: spotipy.Spotify, pid: str) -> Iterable[dict]:
     limit, offset = 100, 0
-    # Запросим ровно то, что нам нужно для CSV/логики
     fields = (
         "items(added_at,track("
         "uri,id,name,artists(name),album(name),"
@@ -200,11 +169,6 @@ def is_unavailable_with_reason(track: Optional[dict], user_country: Optional[str
 
 
 def safe_add_items(sp: spotipy.Spotify, playlist_id: str, uris: List[str], record_bad_uri) -> int:
-    """
-    Добавляет uris партиями, при 400/Unsupported URL рекурсивно делит партию,
-    изолируя плохие URI. Возвращает число успешно добавленных треков.
-    """
-
     added = 0
 
     def add_chunk(chunk: List[str]):
@@ -216,16 +180,13 @@ def safe_add_items(sp: spotipy.Spotify, playlist_id: str, uris: List[str], recor
             added += len(chunk)
             time.sleep(SLEEP_BETWEEN)
         except SpotifyException as e:
-            # Если партия из одного элемента — логируем и пропускаем
             if len(chunk) == 1:
                 record_bad_uri(chunk[0], f"add_failed:{getattr(e, 'msg', str(e))}")
                 return
-            # Делим пополам и пытаемся добавить каждую половину
             mid = len(chunk) // 2
             add_chunk(chunk[:mid])
             add_chunk(chunk[mid:])
 
-    # Пытаемся добавить максимально крупными кусками (до 100) — сюда уже приходят валидные URI
     i = 0
     while i < len(uris):
         batch = uris[i:i+100]
@@ -233,10 +194,6 @@ def safe_add_items(sp: spotipy.Spotify, playlist_id: str, uris: List[str], recor
         i += 100
     return added
 
-
-###############################################################################
-# Фоновая задача
-###############################################################################
 
 def start_job(sp: spotipy.Spotify, *, only_pl_id: Optional[str], max_playlists: Optional[int],
               dry_run: bool, batch_size: int) -> str:
@@ -247,8 +204,8 @@ def start_job(sp: spotipy.Spotify, *, only_pl_id: Optional[str], max_playlists: 
             "progress": {"processed": 0, "total": 0},
             "result": None,
             "playlist_url": None,
-            "csv_rows": [],       # полный список недоступных (для выгрузки)
-            "bad_uri_rows": [],   # проблемные URI при добавлении
+            "csv_rows": [],
+            "bad_uri_rows": [],
         }
 
     def bump_progress(delta: int = 1):
@@ -269,7 +226,7 @@ def start_job(sp: spotipy.Spotify, *, only_pl_id: Optional[str], max_playlists: 
             user_id = user["id"]
             user_country = user.get("country")
 
-            # Собираем список плейлистов
+            # Плейлисты к сканированию
             playlists = []
             if only_pl_id:
                 norm = normalize_playlist_id(only_pl_id)
@@ -278,7 +235,7 @@ def start_job(sp: spotipy.Spotify, *, only_pl_id: Optional[str], max_playlists: 
             else:
                 playlists = list(iter_user_playlists(sp, max_playlists=max_playlists))
 
-            # Оценим общий объём работы (для прогресса)
+            # Прогноз общего объёма
             total_est = 0
             for p in playlists:
                 try:
@@ -287,7 +244,7 @@ def start_job(sp: spotipy.Spotify, *, only_pl_id: Optional[str], max_playlists: 
                     pass
                 time.sleep(SLEEP_BETWEEN)
 
-            # «Понравившиеся» — всегда сканируем
+            # «Понравившиеся» — всегда: здесь НЕЛЬЗЯ передавать fields (в spotipy его нет)
             liked_page = sp.current_user_saved_tracks(limit=1)
             total_est += int(liked_page.get("total") or 0)
 
@@ -295,7 +252,7 @@ def start_job(sp: spotipy.Spotify, *, only_pl_id: Optional[str], max_playlists: 
                 JOBS[job_id]["progress"]["total"] = total_est
 
             seen_uris = set()
-            good_uris: List[str] = []  # валидные spotify:track:<22>, которые будем добавлять
+            good_uris: List[str] = []
 
             # Скан плейлистов
             for pl in playlists:
@@ -305,7 +262,6 @@ def start_job(sp: spotipy.Spotify, *, only_pl_id: Optional[str], max_playlists: 
                     t = item.get("track")
                     unavailable, reason = is_unavailable_with_reason(t, user_country)
                     if unavailable:
-                        # Для CSV
                         row = {
                             "source": pname,
                             "added_at": item.get("added_at"),
@@ -317,8 +273,6 @@ def start_job(sp: spotipy.Spotify, *, only_pl_id: Optional[str], max_playlists: 
                             "reason": reason or "",
                         }
                         add_csv_row(row)
-
-                        # Кандидаты в новый плейлист — только валидные track-URI
                         uri = (t or {}).get("uri")
                         if uri and URI_RE.match(uri) and uri not in seen_uris:
                             seen_uris.add(uri)
@@ -326,16 +280,10 @@ def start_job(sp: spotipy.Spotify, *, only_pl_id: Optional[str], max_playlists: 
                     bump_progress()
                 time.sleep(SLEEP_BETWEEN)
 
-            # Скан «Понравившихся»
+            # Скан «Понравившихся» (БЕЗ параметра fields!)
             limit, offset = 50, 0
-            fields = (
-                "items(added_at,track("
-                "uri,id,name,artists(name),album(name),"
-                "is_playable,available_markets,restrictions"
-                ")),next,total"
-            )
             while True:
-                page = sp.current_user_saved_tracks(limit=limit, offset=offset, market="from_token", fields=fields)
+                page = sp.current_user_saved_tracks(limit=limit, offset=offset, market="from_token")
                 for it in page.get("items", []):
                     t = it.get("track")
                     unavailable, reason = is_unavailable_with_reason(t, user_country)
@@ -351,7 +299,6 @@ def start_job(sp: spotipy.Spotify, *, only_pl_id: Optional[str], max_playlists: 
                             "reason": reason or "",
                         }
                         add_csv_row(row)
-
                         uri = (t or {}).get("uri")
                         if uri and URI_RE.match(uri) and uri not in seen_uris:
                             seen_uris.add(uri)
@@ -362,14 +309,13 @@ def start_job(sp: spotipy.Spotify, *, only_pl_id: Optional[str], max_playlists: 
                 offset += limit
                 time.sleep(SLEEP_BETWEEN)
 
-            # Сборка результирующего плейлиста
+            # Итоговый плейлист
             today = datetime.date.today().isoformat()
             new_pl_name = f"Недоступные треки — {today}"
             playlist_url = None
             added_total = 0
             skipped_invalid = 0
 
-            # Дополнительная фильтрация на случай мусора
             filtered_uris: List[str] = []
             for u in good_uris:
                 if URI_RE.match(u):
@@ -392,8 +338,6 @@ def start_job(sp: spotipy.Spotify, *, only_pl_id: Optional[str], max_playlists: 
                 new_pid = new_pl["id"]
                 playlist_url = f"https://open.spotify.com/playlist/{new_pid}"
 
-                # Добавляем «умно»: пытаемся батчами, при ошибке — раскалываем
-                # (batch_size ограничивает начальный размер партии; safe_add_items сам бьёт до единичных)
                 i = 0
                 while i < len(filtered_uris):
                     batch = filtered_uris[i:i+batch_size]
@@ -421,10 +365,6 @@ def start_job(sp: spotipy.Spotify, *, only_pl_id: Optional[str], max_playlists: 
     threading.Thread(target=worker, daemon=True).start()
     return job_id
 
-
-###############################################################################
-# Веб-маршруты и шаблоны
-###############################################################################
 
 INDEX_HTML = """
 <!doctype html>
@@ -556,7 +496,6 @@ def csv_unavailable(job_id: str):
             abort(404)
         rows = job.get("csv_rows") or []
 
-    # Гарантируем стабильный порядок колонок
     cols = ["source", "added_at", "track_name", "artists", "album", "track_uri", "track_id", "reason"]
     si = io.StringIO()
     w = csv.DictWriter(si, fieldnames=cols)
@@ -589,5 +528,4 @@ def healthz():
     return "ok", 200
 
 if __name__ == "__main__":
-    # Локальный запуск (на проде используйте gunicorn с увеличенным таймаутом)
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")), debug=False)
