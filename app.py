@@ -39,6 +39,7 @@ SCOPES = [
     "playlist-read-collaborative",
     "playlist-modify-private",
     "playlist-modify-public",
+    "user-library-read"
     # при необходимости добавьте "user-library-read" (для «Понравившихся»)
 ]
 
